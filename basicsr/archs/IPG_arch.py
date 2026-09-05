@@ -21,6 +21,7 @@ import torch.utils.checkpoint as checkpoint
 import torch.nn.functional as F
 from basicsr.utils.registry import ARCH_REGISTRY
 from basicsr.archs.arch_util import to_2tuple, trunc_normal_
+from basicsr.archs.dual_laplacian import DualGraphLaplacian
 import numpy as np
 import einops
 
@@ -238,7 +239,7 @@ class IPG_Grapher(nn.Module):
         self.proj_sample = nn.Linear(dim, dim * 2, bias=bias)
 
         self.proj = nn.Linear(dim, dim)
-
+        self.dual_laplacian = DualGraphLaplacian(alpha=0.01)
 
         # rel pos bias
         self.cpb_mlp = nn.Sequential(nn.Linear(2, 512, bias=True),
@@ -329,6 +330,8 @@ class IPG_Grapher(nn.Module):
             x = global_sampling(x_complete, group_size=self.group_size, sample_size=None, output=0, tp='bhwc')
             
         b_, n, c = x.shape
+        x = self.dual_laplacian(x)
+        
         x1 = einops.rearrange(self.proj_group(x), 'b n (h c) -> b h n c', b=b_, n=n, h=self.num_heads)
 
         if sampling_method == 0:
