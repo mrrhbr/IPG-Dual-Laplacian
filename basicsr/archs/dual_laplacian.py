@@ -11,7 +11,8 @@ class DualGraphLaplacian(nn.Module):
 
 
     def forward(self, x, H=None, W=None):
-
+        print("🔥 Dual Laplacian forward activated")
+        print("feature:", x.shape)
         B, N, C = x.shape
 
         # recover spatial size
