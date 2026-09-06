@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 class DualGraphLaplacian(nn.Module):
 
-    def __init__(self, alpha=0.01, debug=False):
+    def __init__(self, alpha=0.05, debug=False):
         super().__init__()
 
         self.alpha = alpha
