@@ -11,6 +11,7 @@ class DualGraphLaplacian(nn.Module):
         self.alpha = alpha
         self.debug = debug
         self._printed = False
+        self._delta_printed = False
 
 
     def forward(self, x, H=None, W=None):
@@ -32,14 +33,6 @@ class DualGraphLaplacian(nn.Module):
 
         if H * W != N:
             return x
-
-
-
-        # ---- debug only once ----
-        if self.debug and not self._printed:
-            print("🔥 Dual Laplacian forward activated")
-            print("feature:", x.shape)
-            self._printed = True
 
 
 
@@ -212,7 +205,13 @@ class DualGraphLaplacian(nn.Module):
         # normalize response
         dual_response = (
             dual_response /
-            (dual_response.norm(dim=-1,keepdim=True)+eps)
+            (
+                dual_response.norm(
+                    dim=-1,
+                    keepdim=True
+                )
+                + eps
+            )
         )
 
 
@@ -225,17 +224,34 @@ class DualGraphLaplacian(nn.Module):
         )
 
 
-        if self.debug and self.training:
-            delta = (
-                out-feat_flat
-            ).abs().mean().item()
+        # =========================
+        # Debug
+        # =========================
 
-            if not hasattr(self,"_delta_printed"):
-                print(
-                    "Dual Laplacian feature delta:",
-                    delta
-                )
-                self._delta_printed=True
+        if self.debug and self.training:
+
+            diff = out - feat_flat
+
+            delta_abs = diff.abs().mean().item()
+
+            delta_norm = diff.norm().item()
+
+            feature_norm = feat_flat.norm().item()
+
+            ratio = delta_norm / (feature_norm + eps)
+
+
+            if not self._delta_printed:
+
+                print("====== Dual Laplacian Debug ======")
+                print("feature norm :", feature_norm)
+                print("delta abs    :", delta_abs)
+                print("delta norm   :", delta_norm)
+                print("ratio        :", ratio)
+                print("alpha        :", self.alpha)
+
+                self._delta_printed = True
+
 
 
         return out
