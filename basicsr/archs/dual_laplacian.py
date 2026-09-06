@@ -5,44 +5,78 @@ import torch.nn.functional as F
 
 class DualGraphLaplacian(nn.Module):
 
-    def __init__(self, alpha=0.01):
+    def __init__(self, alpha=0.01, debug=False):
         super().__init__()
+
         self.alpha = alpha
+        self.debug = debug
+        self._printed = False
 
 
     def forward(self, x, H=None, W=None):
-        print("🔥 Dual Laplacian forward activated")
-        print("feature:", x.shape)
+
         B, N, C = x.shape
 
-        # recover spatial size
+
+        # infer spatial size
         if H is None or W is None:
-            H = int(N ** 0.5)
-            W = H
+
+            size = int(N ** 0.5)
+
+            if size * size != N:
+                return x
+
+            H = size
+            W = size
+
 
         if H * W != N:
             return x
 
-        # [B,H,W,C]
-        feat = x.reshape(B,H,W,C)
 
-        # [B,N,C]
-        feat_flat = feat.reshape(B,N,C)
 
+        # ---- debug only once ----
+        if self.debug and not self._printed:
+            print("🔥 Dual Laplacian forward activated")
+            print("feature:", x.shape)
+            self._printed = True
+
+
+
+        feat = x.reshape(
+            B,
+            H,
+            W,
+            C
+        )
+
+
+        feat_flat = feat.reshape(
+            B,
+            N,
+            C
+        )
+
+
+        # =========================
         # Feature affinity
+        # =========================
+
         feat_norm = F.normalize(
             feat_flat,
             dim=-1
         )
 
-        # cosine similarity
-        S = torch.matmul(
+
+        S = torch.bmm(
             feat_norm,
             feat_norm.transpose(1,2)
         )
 
 
+        # =========================
         # Row graph
+        # =========================
 
         row_ids = torch.arange(
             H,
@@ -51,15 +85,17 @@ class DualGraphLaplacian(nn.Module):
 
 
         M_row = (
-            row_ids[:,None] ==
+            row_ids[:,None]
+            ==
             row_ids[None,:]
         ).float()
 
 
-        M_row = M_row.unsqueeze(0)
 
-
+        # =========================
         # Column graph
+        # =========================
+
         col_ids = torch.arange(
             W,
             device=x.device
@@ -67,18 +103,26 @@ class DualGraphLaplacian(nn.Module):
 
 
         M_col = (
-            col_ids[:,None] ==
+            col_ids[:,None]
+            ==
             col_ids[None,:]
         ).float()
 
 
+
+        M_row = M_row.unsqueeze(0)
         M_col = M_col.unsqueeze(0)
 
-        # adjacency matrices
+
+
+        # =========================
+        # adjacency
+        # =========================
+
         A_row = S * M_row
         A_col = S * M_col
 
-        # remove self connection
+
         eye = torch.eye(
             N,
             device=x.device
@@ -89,25 +133,27 @@ class DualGraphLaplacian(nn.Module):
         A_col = A_col * (1-eye)
 
 
-        # Normalizing connecitons
+
         A_row = F.relu(A_row)
         A_col = F.relu(A_col)
 
 
-        # Normalized Laplacian
+
+        # =========================
+        # normalized Laplacian
+        # =========================
+
         eps = 1e-6
-        D_row = A_row.sum(dim=-1) + eps
-        D_col = A_col.sum(dim=-1) + eps
 
-        D_row_inv = torch.pow(
-            D_row,
-            -0.5
-        )
 
-        D_col_inv = torch.pow(
-            D_col,
-            -0.5
-        )
+        D_row = A_row.sum(-1) + eps
+        D_col = A_col.sum(-1) + eps
+
+
+        D_row_inv = torch.rsqrt(D_row)
+        D_col_inv = torch.rsqrt(D_col)
+
+
 
         A_row_norm = (
             D_row_inv.unsqueeze(-1)
@@ -135,28 +181,61 @@ class DualGraphLaplacian(nn.Module):
 
 
         L_row = I - A_row_norm
-
         L_col = I - A_col_norm
 
 
 
-        # Laplacian filtering
+        # =========================
+        # Laplacian response
+        # =========================
 
-        row_out = torch.bmm(
+        row_response = torch.bmm(
             L_row,
             feat_flat
         )
 
 
-        col_out = torch.bmm(
+        col_response = torch.bmm(
             L_col,
             feat_flat
         )
 
 
 
-        # dual graph response
-        dual_response = row_out + col_out
-        out = feat_flat + self.alpha * dual_response
+        dual_response = (
+            row_response
+            +
+            col_response
+        )
+
+
+        # normalize response
+        dual_response = (
+            dual_response /
+            (dual_response.norm(dim=-1,keepdim=True)+eps)
+        )
+
+
+
+        out = (
+            feat_flat
+            +
+            self.alpha *
+            dual_response
+        )
+
+
+        if self.debug and self.training:
+            delta = (
+                out-feat_flat
+            ).abs().mean().item()
+
+            if not hasattr(self,"_delta_printed"):
+                print(
+                    "Dual Laplacian feature delta:",
+                    delta
+                )
+                self._delta_printed=True
+
+
         return out
-        
