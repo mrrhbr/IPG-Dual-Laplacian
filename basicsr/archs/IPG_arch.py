@@ -239,8 +239,8 @@ class IPG_Grapher(nn.Module):
         self.proj_sample = nn.Linear(dim, dim * 2, bias=bias)
 
         self.proj = nn.Linear(dim, dim)
-        self.dual_laplacian = DualGraphLaplacian(alpha=0.01)
-
+        self.dual_laplacian = DualGraphLaplacian(alpha=0.01,debug=True)
+                     
         # rel pos bias
         self.cpb_mlp = nn.Sequential(nn.Linear(2, 512, bias=True),
                                      nn.ReLU(inplace=True),
@@ -330,7 +330,6 @@ class IPG_Grapher(nn.Module):
             x = global_sampling(x_complete, group_size=self.group_size, sample_size=None, output=0, tp='bhwc')
             
         b_, n, c = x.shape
-        x = self.dual_laplacian(x)
         
         x1 = einops.rearrange(self.proj_group(x), 'b n (h c) -> b h n c', b=b_, n=n, h=self.num_heads)
 
@@ -345,6 +344,8 @@ class IPG_Grapher(nn.Module):
 
         x = (corr @ feat).transpose(1, 2).reshape(b_, n, c)
         x = self.proj(x)
+        x = self.dual_laplacian(x)
+
 
         return x
 
