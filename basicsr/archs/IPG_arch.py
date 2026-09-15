@@ -239,7 +239,9 @@ class IPG_Grapher(nn.Module):
         self.proj_sample = nn.Linear(dim, dim * 2, bias=bias)
 
         self.proj = nn.Linear(dim, dim)
-        self.dual_laplacian = DualGraphLaplacian(alpha=0.01,debug=True)
+        self.dual_laplacian = DualGraphLaplacian(
+          alpha=kwargs.get('dgl_alpha', 0.01),
+          debug=True)
                      
         # rel pos bias
         self.cpb_mlp = nn.Sequential(nn.Linear(2, 512, bias=True),
