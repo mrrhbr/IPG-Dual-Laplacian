@@ -68,6 +68,8 @@ network_g:
   num_heads: [6, 6, 6, 6, 6, 6]
   mlp_ratio: 4
   upsampler: 'pixelshuffle'
+  # DGL regularization
+  dgl_alpha: 0.01
   resi_connection: '1conv'
   graph_flags: [1, 1, 1, 1, 1, 1] # BOOL
   stage_spec: [['GN','GS','GN','GS','GN','GS'],['GN','GS','GN','GS','GN','GS'],['GN','GS','GN','GS','GN','GS'],['GN','GS','GN','GS','GN','GS'],['GN','GS','GN','GS','GN','GS'],['GN','GS','GN','GS','GN','GS']]
