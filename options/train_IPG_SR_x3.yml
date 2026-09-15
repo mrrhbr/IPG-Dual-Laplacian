@@ -69,6 +69,9 @@ network_g:
   mlp_ratio: 4
   upsampler: 'pixelshuffle'
   resi_connection: '1conv'
+  # DGL regularization
+  dgl_alpha: 0.01
+
   graph_flags: [1, 1, 1, 1, 1, 1] # BOOL
   stage_spec: [['GN','GS','GN','GS','GN','GS'],['GN','GS','GN','GS','GN','GS'],['GN','GS','GN','GS','GN','GS'],['GN','GS','GN','GS','GN','GS'],['GN','GS','GN','GS','GN','GS'],['GN','GS','GN','GS','GN','GS']]
   dist_type: 'cossim'
