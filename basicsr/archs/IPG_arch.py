@@ -239,7 +239,6 @@ class IPG_Grapher(nn.Module):
         self.proj_sample = nn.Linear(dim, dim * 2, bias=bias)
 
         self.proj = nn.Linear(dim, dim)
-        self.dual_laplacian = DualGraphLaplacian(alpha=0.01,debug=True)
                      
         # rel pos bias
         self.cpb_mlp = nn.Sequential(nn.Linear(2, 512, bias=True),
@@ -344,9 +343,6 @@ class IPG_Grapher(nn.Module):
 
         x = (corr @ feat).transpose(1, 2).reshape(b_, n, c)
         x = self.proj(x)
-        x = self.dual_laplacian(x)
-
-
         return x
 
     def extra_repr(self) -> str:
@@ -602,6 +598,7 @@ class MGB(nn.Module):
                  resi_connection='1conv',stage_idx=None, **kwargs):
         super(MGB, self).__init__()
         self.kwargs = kwargs
+        self.debug = kwargs.get('debug', False)
 
         self.dim = dim
         self.input_resolution = input_resolution
@@ -626,6 +623,9 @@ class MGB(nn.Module):
         # flex graph
         self.flex_type = kwargs.get('flex_type')
         self.graph_switch = kwargs.get('graph_switch')
+        self.dual_laplacian = DualGraphLaplacian(
+            alpha=kwargs.get('dgl_alpha', 0.02),
+            debug=True)
 
         self.stage_idx = stage_idx
         self.output_folder = kwargs.get('output_folder')
@@ -712,6 +712,11 @@ class MGB(nn.Module):
 
         graph0 = self.calc_graph_(x_, x_size, sampling_method=0, X_diff=X_diff[0])
         graph1 = self.calc_graph_(x_, x_size, sampling_method=1, X_diff=X_diff[1])
+        if self.debug:
+            print("graph0 density:", graph0.float().mean().item())
+            print("graph1 density:", graph1.float().mean().item())
+        
+        
         return (graph0, graph1)
 
     @torch.no_grad()
@@ -778,9 +783,75 @@ class MGB(nn.Module):
         return graph
 
 
-    def forward(self, x, x_size, prev_graph=None):
-        graph = self.calc_graph(x, x_size) if self.graph_flag else prev_graph
-        return self.patch_embed(self.conv(self.patch_unembed(self.residual_group(x, x_size, graph), x_size))) + x, graph
+def forward(self, x, x_size, prev_graph=None):
+
+    print("MGB x:", x.shape)
+    print("x_size:", x_size)
+    print("H*W:", x_size[0]*x_size[1])
+
+
+    # baseline graph
+    graph_base = (
+        self.calc_graph(x, x_size)
+        if self.graph_flag
+        else prev_graph
+    )
+
+
+    # DGL feature
+    x_graph = self.dual_laplacian(
+        x,
+        H=x_size[0],
+        W=x_size[1]
+    )
+
+
+    # DGL guided graph
+    graph_dgl = (
+        self.calc_graph(x_graph, x_size)
+        if self.graph_flag
+        else prev_graph
+    )
+
+
+    print("DGL delta:",
+          (x_graph-x).abs().mean().item())
+
+
+    # compare local graph
+    local_change = (
+        graph_base[0] != graph_dgl[0]
+    ).float().mean()
+
+    # compare global graph
+    global_change = (
+        graph_base[1] != graph_dgl[1]
+    ).float().mean()
+
+
+    print("Local graph change:",
+          local_change.item())
+
+    print("Global graph change:",
+          global_change.item())
+
+
+    out = self.residual_group(
+        x,
+        x_size,
+        graph_dgl
+    )
+
+
+    return self.patch_embed(
+        self.conv(
+            self.patch_unembed(
+                out,
+                x_size
+            )
+        )
+    ) + x, graph_dgl
+    
 
     def flops(self):
         flops = 0
