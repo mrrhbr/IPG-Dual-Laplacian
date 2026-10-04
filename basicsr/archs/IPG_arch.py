@@ -884,7 +884,7 @@ class MGB(nn.Module):
         return graph
 
 
-def forward(self, x, x_size, prev_graph=None):
+    def forward(self, x, x_size, prev_graph=None):
 
     print("MGB x:", x.shape)
     print("x_size:", x_size)
@@ -940,10 +940,8 @@ def forward(self, x, x_size, prev_graph=None):
     out = self.residual_group(
         x,
         x_size,
-        graph_dgl
-    )
-
-
+        graph_dgl)
+    
     return self.patch_embed(
         self.conv(
             self.patch_unembed(
