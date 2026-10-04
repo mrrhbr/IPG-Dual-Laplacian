@@ -781,76 +781,67 @@ class MGB(nn.Module):
                 list_to_save.append(graph.cpu())
             
         return graph
-
-
-def forward(self, x, x_size, prev_graph=None):
-
-    print("MGB x:", x.shape)
-    print("x_size:", x_size)
-    print("H*W:", x_size[0]*x_size[1])
-
-
-    # baseline graph
-    graph_base = (
+        
+        
+        
+    def forward(self, x, x_size, prev_graph=None):
+        print("MGB x:", x.shape)
+        print("x_size:", x_size)
+        print("H*W:", x_size[0]*x_size[1])
+        
+        # baseline graph
+        graph_base = (
         self.calc_graph(x, x_size)
         if self.graph_flag
         else prev_graph
-    )
-
-
-    # DGL feature
-    x_graph = self.dual_laplacian(
+        )
+        # DGL feature
+        
+        x_graph = self.dual_laplacian(
         x,
         H=x_size[0],
         W=x_size[1]
-    )
-
-
-    # DGL guided graph
-    graph_dgl = (
+        )
+        
+        # DGL guided graph
+        
+        graph_dgl = (
         self.calc_graph(x_graph, x_size)
         if self.graph_flag
-        else prev_graph
-    )
-
-
-    print("DGL delta:",
+        else prev_graph)
+        
+        
+        print("DGL delta:",
           (x_graph-x).abs().mean().item())
-
-
-    # compare local graph
-    local_change = (
-        graph_base[0] != graph_dgl[0]
-    ).float().mean()
-
-    # compare global graph
-    global_change = (
-        graph_base[1] != graph_dgl[1]
-    ).float().mean()
-
-
-    print("Local graph change:",
+        
+        
+        # compare local graph
+        
+        local_change = (
+        graph_base[0] != graph_dgl[0]).float().mean()
+        
+        
+        # compare global graph
+        global_change = (
+        graph_base[1] != graph_dgl[1]).float().mean()
+        
+        print("Local graph change:",
           local_change.item())
-
-    print("Global graph change:",
+        
+        print("Global graph change:",
           global_change.item())
-
-
-    out = self.residual_group(
+        
+        out = self.residual_group(
         x,
         x_size,
-        graph_dgl
-    )
-
-
-    return self.patch_embed(
+        graph_dgl)
+        
+        
+        return self.patch_embed(
         self.conv(
             self.patch_unembed(
                 out,
-                x_size
-            )
-        )
-    ) + x, graph_dgl
+                x_size))) + x, graph_dgl
     
 
     def flops(self):
