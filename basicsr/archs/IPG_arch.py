@@ -786,28 +786,23 @@ class MGB(nn.Module):
 
     def forward(self, x, x_size, prev_graph=None):
 
-        x_graph = self.dual_laplacian(
+        x_dgl = self.dual_laplacian(
             x,
             H=x_size[0],
             W=x_size[1]
         )
     
-        x_dgl = x + self.dgl_scale * (x_graph - x)
-    
-    
         graph = (
-            self.calc_graph(x, x_size)
+            self.calc_graph(x_dgl, x_size)
             if self.graph_flag
             else prev_graph
         )
-    
     
         out = self.residual_group(
             x_dgl,
             x_size,
             graph
         )
-    
     
         return self.patch_embed(
             self.conv(
