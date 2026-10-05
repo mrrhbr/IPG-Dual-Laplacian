@@ -10,199 +10,259 @@ class DualGraphLaplacian(nn.Module):
 
         self.alpha = alpha
         self.debug = debug
-        self._printed = False
         self._delta_printed = False
 
 
-    def forward(self, x, H=None, W=None):
-
-        B, N, C = x.shape
-
-
-        # infer spatial size
-        if H is None or W is None:
-
-            size = int(N ** 0.5)
-
-            if size * size != N:
-                return x
-
-            H = size
-            W = size
-
-
-        if H * W != N:
-            return x
-
-
-
-        feat = x.reshape(
-            B,
-            H,
-            W,
-            C
-        )
-
-
-        feat_flat = feat.reshape(
-            B,
-            N,
-            C
-        )
-
-
-        # =========================
-        # Feature affinity
-        # =========================
-
-        feat_norm = F.normalize(
-            feat_flat,
-            dim=-1
-        )
-
-
-        S = torch.bmm(
-            feat_norm,
-            feat_norm.transpose(1,2)
-        )
-
-
-        # =========================
-        # Row graph
-        # =========================
-
-        row_ids = torch.arange(
-            H,
-            device=x.device
-        ).repeat_interleave(W)
-
-
-        M_row = (
-            row_ids[:,None]
-            ==
-            row_ids[None,:]
-        ).float()
-
-
-
-        # =========================
-        # Column graph
-        # =========================
-
-        col_ids = torch.arange(
-            W,
-            device=x.device
-        ).repeat(H)
-
-
-        M_col = (
-            col_ids[:,None]
-            ==
-            col_ids[None,:]
-        ).float()
-
-
-
-        M_row = M_row.unsqueeze(0)
-        M_col = M_col.unsqueeze(0)
-
-
-
-        # =========================
-        # adjacency
-        # =========================
-
-        A_row = S * M_row
-        A_col = S * M_col
-
-
-        eye = torch.eye(
-            N,
-            device=x.device
-        ).unsqueeze(0)
-
-
-        A_row = A_row * (1-eye)
-        A_col = A_col * (1-eye)
-
-
-
-        A_row = F.relu(A_row)
-        A_col = F.relu(A_col)
-
-
-
-        # =========================
-        # normalized Laplacian
-        # =========================
+    def build_laplacian(self, A):
 
         eps = 1e-6
 
+        # remove self connection
+        N = A.size(-1)
 
-        D_row = A_row.sum(-1) + eps
-        D_col = A_col.sum(-1) + eps
+        eye = torch.eye(
+            N,
+            device=A.device
+        ).unsqueeze(0)
+
+        A = A * (1 - eye)
 
 
-        D_row_inv = torch.rsqrt(D_row)
-        D_col_inv = torch.rsqrt(D_col)
+        # cosine -> positive affinity
+
+        A = (A + 1) / 2
 
 
+        D = A.sum(-1) + eps
 
-        A_row_norm = (
-            D_row_inv.unsqueeze(-1)
+        D_inv = torch.rsqrt(D)
+
+
+        A_norm = (
+            D_inv.unsqueeze(-1)
             *
-            A_row
+            A
             *
-            D_row_inv.unsqueeze(-2)
-        )
-
-
-        A_col_norm = (
-            D_col_inv.unsqueeze(-1)
-            *
-            A_col
-            *
-            D_col_inv.unsqueeze(-2)
+            D_inv.unsqueeze(-2)
         )
 
 
         I = torch.eye(
             N,
-            device=x.device
+            device=A.device
         ).unsqueeze(0)
 
 
-
-        L_row = I - A_row_norm
-        L_col = I - A_col_norm
+        L = I - A_norm
 
 
+        return L
 
-        # =========================
-        # Laplacian response
-        # =========================
+
+
+    def forward(self, x, H=None, W=None):
+
+        B,N,C = x.shape
+
+
+        if H is None or W is None:
+
+            size = int(N ** 0.5)
+
+            if size*size != N:
+                return x
+
+            H=size
+            W=size
+
+
+        if H*W != N:
+            return x
+
+
+
+        # --------------------------------
+        # feature map
+        # --------------------------------
+
+        feat = x.reshape(
+            B,H,W,C
+        )
+
+
+        # =================================
+        # Row node representation
+        # =================================
+
+        row_mean = feat.mean(
+            dim=2
+        )
+
+        row_max = feat.max(
+            dim=2
+        )[0]
+
+
+        row_feat = torch.cat(
+            [
+                row_mean,
+                row_max
+            ],
+            dim=-1
+        )
+
+
+        # B,H,2C
+
+
+        # =================================
+        # Column node representation
+        # =================================
+
+        col_mean = feat.mean(
+            dim=1
+        )
+
+
+        col_max = feat.max(
+            dim=1
+        )[0]
+
+
+        col_feat = torch.cat(
+            [
+                col_mean,
+                col_max
+            ],
+            dim=-1
+        )
+
+
+        # B,W,2C
+
+
+
+        # =================================
+        # Normalize node features
+        # =================================
+
+        row_feat = F.normalize(
+            row_feat,
+            dim=-1
+        )
+
+
+        col_feat = F.normalize(
+            col_feat,
+            dim=-1
+        )
+
+
+
+        # =================================
+        # Row / Column affinity
+        # =================================
+
+        A_row = torch.bmm(
+            row_feat,
+            row_feat.transpose(1,2)
+        )
+
+
+        A_col = torch.bmm(
+            col_feat,
+            col_feat.transpose(1,2)
+        )
+
+
+
+        # =================================
+        # Laplacian
+        # =================================
+
+        L_row = self.build_laplacian(
+            A_row
+        )
+
+
+        L_col = self.build_laplacian(
+            A_col
+        )
+
+
+
+        # =================================
+        # Graph propagation
+        # =================================
+
+
+        # row graph filtering
 
         row_response = torch.bmm(
             L_row,
-            feat_flat
+            row_mean
         )
+
+
+        # B,H,C
+
+
+        row_response = row_response.unsqueeze(2)
+
+
+        row_response = row_response.expand(
+            B,
+            H,
+            W,
+            C
+        )
+
+
+
+        # column graph filtering
 
 
         col_response = torch.bmm(
             L_col,
-            feat_flat
+            col_mean
+        )
+
+
+        # B,W,C
+
+
+        col_response = col_response.unsqueeze(1)
+
+
+        col_response = col_response.expand(
+            B,
+            H,
+            W,
+            C
         )
 
 
 
+        # =================================
+        # Dual response
+        # =================================
+
         dual_response = (
-            row_response
-            +
+            row_response +
             col_response
         )
 
 
-        # normalize response
+        dual_response = dual_response.reshape(
+            B,
+            N,
+            C
+        )
+
+
+
+        # normalize update
+
         dual_response = (
             dual_response /
             (
@@ -210,49 +270,37 @@ class DualGraphLaplacian(nn.Module):
                     dim=-1,
                     keepdim=True
                 )
-                + eps
+                +1e-6
             )
         )
 
 
 
         out = (
-            feat_flat
-            +
+            x +
             self.alpha *
             dual_response
         )
 
 
-        # =========================
+
+        # =================================
         # Debug
-        # =========================
+        # =================================
 
-        if self.debug and self.training:
+        if self.debug and not self._delta_printed:
 
-            diff = out - feat_flat
+            diff = out-x
 
-            delta_abs = diff.abs().mean().item()
+            print("====== Dual Row Column Laplacian ======")
+            print("input:",x.shape)
+            print("row graph:",A_row.shape)
+            print("col graph:",A_col.shape)
+            print("delta:",diff.abs().mean().item())
+            print("alpha:",self.alpha)
 
-            delta_norm = diff.norm().item()
-
-            feature_norm = feat_flat.norm().item()
-
-            ratio = delta_norm / (feature_norm + eps)
-
-
-            if not self._delta_printed:
-
-                print("====== Dual Laplacian Debug ======")
-                print("feature norm :", feature_norm)
-                print("delta abs    :", delta_abs)
-                print("delta norm   :", delta_norm)
-                print("ratio        :", ratio)
-                print("alpha        :", self.alpha)
-
-                self._delta_printed = True
+            self._delta_printed=True
 
 
 
         return out
-
