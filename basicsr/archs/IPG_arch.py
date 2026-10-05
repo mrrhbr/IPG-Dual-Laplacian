@@ -626,7 +626,7 @@ class MGB(nn.Module):
         self.dual_laplacian = DualGraphLaplacian(
             alpha=kwargs.get('dgl_alpha', 0.02),
             debug=True)
-        self.dgl_scale = nn.Parameter(torch.tensor(0.5))
+        
 
         self.stage_idx = stage_idx
         self.output_folder = kwargs.get('output_folder')
