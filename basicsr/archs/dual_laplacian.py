@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 class DualGraphLaplacian(nn.Module):
 
-    def __init__(self, alpha=0.05, debug=False):
+    def __init__(self, dim, alpha=0.05, debug=False):
         super().__init__()
 
         self.alpha = alpha
@@ -13,22 +13,37 @@ class DualGraphLaplacian(nn.Module):
         self._delta_printed = False
 
 
+        # Attention pooling for rows
+        self.row_attention = nn.Sequential(
+            nn.Linear(dim, dim // 2),
+            nn.GELU(),
+            nn.Linear(dim // 2, 1)
+        )
+
+
+        # Attention pooling for columns
+        self.col_attention = nn.Sequential(
+            nn.Linear(dim, dim // 2),
+            nn.GELU(),
+            nn.Linear(dim // 2, 1)
+        )
+
+
     def build_laplacian(self, A):
 
         eps = 1e-6
 
-        # remove self connection
         N = A.size(-1)
 
         eye = torch.eye(
             N,
-            device=A.device
+            device=A.device,
+            dtype=A.dtype
         ).unsqueeze(0)
 
-        A = A * (1 - eye)
 
-
-        # cosine -> positive affinity
+        # keep same as Exp3
+        A = A * (1-eye)
 
         A = (A + 1) / 2
 
@@ -49,7 +64,8 @@ class DualGraphLaplacian(nn.Module):
 
         I = torch.eye(
             N,
-            device=A.device
+            device=A.device,
+            dtype=A.dtype
         ).unsqueeze(0)
 
 
@@ -60,14 +76,14 @@ class DualGraphLaplacian(nn.Module):
 
 
 
-    def forward(self, x, H=None, W=None):
+    def forward(self,x,H=None,W=None):
 
         B,N,C = x.shape
 
 
         if H is None or W is None:
 
-            size = int(N ** 0.5)
+            size=int(N**0.5)
 
             if size*size != N:
                 return x
@@ -81,70 +97,58 @@ class DualGraphLaplacian(nn.Module):
 
 
 
-        # --------------------------------
-        # feature map
-        # --------------------------------
-
         feat = x.reshape(
             B,H,W,C
         )
 
 
-        # =================================
-        # Row node representation
-        # =================================
+        # =========================
+        # Attention Row Token
+        # =========================
 
-        row_mean = feat.mean(
+        row_score = self.row_attention(feat)
+
+
+        row_weight = F.softmax(
+            row_score,
             dim=2
         )
 
-        row_max = feat.max(
+
+        row_feat = torch.sum(
+            row_weight * feat,
             dim=2
-        )[0]
-
-
-        row_feat = torch.cat(
-            [
-                row_mean,
-                row_max
-            ],
-            dim=-1
         )
 
 
-        # B,H,2C
+        # B,H,C
 
 
-        # =================================
-        # Column node representation
-        # =================================
 
-        col_mean = feat.mean(
+        # =========================
+        # Attention Column Token
+        # =========================
+
+        col_score = self.col_attention(feat)
+
+
+        col_weight = F.softmax(
+            col_score,
             dim=1
         )
 
 
-        col_max = feat.max(
+        col_feat = torch.sum(
+            col_weight * feat,
             dim=1
-        )[0]
-
-
-        col_feat = torch.cat(
-            [
-                col_mean,
-                col_max
-            ],
-            dim=-1
         )
 
 
-        # B,W,2C
+        # B,W,C
 
 
 
-        # =================================
-        # Normalize node features
-        # =================================
+        # normalize
 
         row_feat = F.normalize(
             row_feat,
@@ -159,9 +163,9 @@ class DualGraphLaplacian(nn.Module):
 
 
 
-        # =================================
-        # Row / Column affinity
-        # =================================
+        # =========================
+        # Affinity
+        # =========================
 
         A_row = torch.bmm(
             row_feat,
@@ -176,14 +180,13 @@ class DualGraphLaplacian(nn.Module):
 
 
 
-        # =================================
+        # =========================
         # Laplacian
-        # =================================
+        # =========================
 
         L_row = self.build_laplacian(
             A_row
         )
-
 
         L_col = self.build_laplacian(
             A_col
@@ -191,61 +194,41 @@ class DualGraphLaplacian(nn.Module):
 
 
 
-        # =================================
-        # Graph propagation
-        # =================================
-
-
-        # row graph filtering
+        # =========================
+        # Propagation
+        # =========================
 
         row_response = torch.bmm(
             L_row,
-            row_mean
+            row_feat
         )
 
 
-        # B,H,C
+        col_response = torch.bmm(
+            L_col,
+            col_feat
+        )
 
+
+
+        # back to image grid
 
         row_response = row_response.unsqueeze(2)
 
 
         row_response = row_response.expand(
-            B,
-            H,
-            W,
-            C
+            B,H,W,C
         )
-
-
-
-        # column graph filtering
-
-
-        col_response = torch.bmm(
-            L_col,
-            col_mean
-        )
-
-
-        # B,W,C
 
 
         col_response = col_response.unsqueeze(1)
 
 
         col_response = col_response.expand(
-            B,
-            H,
-            W,
-            C
+            B,H,W,C
         )
 
 
-
-        # =================================
-        # Dual response
-        # =================================
 
         dual_response = (
             row_response +
@@ -254,14 +237,10 @@ class DualGraphLaplacian(nn.Module):
 
 
         dual_response = dual_response.reshape(
-            B,
-            N,
-            C
+            B,N,C
         )
 
 
-
-        # normalize update
 
         dual_response = (
             dual_response /
@@ -275,7 +254,6 @@ class DualGraphLaplacian(nn.Module):
         )
 
 
-
         out = (
             x +
             self.alpha *
@@ -284,15 +262,11 @@ class DualGraphLaplacian(nn.Module):
 
 
 
-        # =================================
-        # Debug
-        # =================================
-
         if self.debug and not self._delta_printed:
 
             diff = out-x
 
-            print("====== Dual Row Column Laplacian ======")
+            print("===== Attention Dual Laplacian =====")
             print("input:",x.shape)
             print("row graph:",A_row.shape)
             print("col graph:",A_col.shape)
