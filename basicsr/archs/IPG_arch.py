@@ -624,6 +624,7 @@ class MGB(nn.Module):
         self.flex_type = kwargs.get('flex_type')
         self.graph_switch = kwargs.get('graph_switch')
         self.dual_laplacian = DualGraphLaplacian(
+            dim=dim,
             alpha=kwargs.get('dgl_alpha', 0.01),
             debug=True)
         
