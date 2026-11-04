@@ -1,151 +1,364 @@
+
 from torch.utils import data as data
 from torchvision.transforms.functional import normalize
 
-from basicsr.data.data_util import paired_paths_from_folder, paired_paths_from_lmdb, paired_paths_from_meta_info_file
+from basicsr.data.data_util import (
+    paired_paths_from_folder,
+    paired_paths_from_lmdb,
+    paired_paths_from_meta_info_file
+)
 from basicsr.data.transforms import augment, paired_random_crop
 from basicsr.utils import FileClient, imfrombytes, img2tensor
 from basicsr.utils.matlab_functions import rgb2ycbcr
 from basicsr.utils.registry import DATASET_REGISTRY
 
+from os import path as osp
+import random
 import numpy as np
+import torch
+
 
 @DATASET_REGISTRY.register()
 class PairedImageDataset(data.Dataset):
-    """Paired image dataset for image restoration.
-
-    Read LQ (Low Quality, e.g. LR (Low Resolution), blurry, noisy, etc) and GT image pairs.
-
-    There are three modes:
-    1. 'lmdb': Use lmdb files.
-        If opt['io_backend'] == lmdb.
-    2. 'meta_info_file': Use meta information file to generate paths.
-        If opt['io_backend'] != lmdb and opt['meta_info_file'] is not None.
-    3. 'folder': Scan folders to generate paths.
-        The rest.
-
-    Args:
-        opt (dict): Config for train datasets. It contains the following keys:
-            dataroot_gt (str): Data root path for gt.
-            dataroot_lq (str): Data root path for lq.
-            meta_info_file (str): Path for meta information file.
-            io_backend (dict): IO backend type and other kwarg.
-            filename_tmpl (str): Template for each filename. Note that the template excludes the file extension.
-                Default: '{}'.
-            gt_size (int): Cropped patched size for gt patches.
-            use_hflip (bool): Use horizontal flips.
-            use_rot (bool): Use rotation (use vertical flip and transposing h and w for implementation).
-
-            scale (bool): Scale, which will be added automatically.
-            phase (str): 'train' or 'val'.
-    """
+    """Paired image dataset for image restoration."""
 
     def __init__(self, opt):
         super(PairedImageDataset, self).__init__()
+
         self.opt = opt
-        # file client (io backend)
         self.file_client = None
         self.io_backend_opt = opt['io_backend']
+
         self.mean = opt['mean'] if 'mean' in opt else None
         self.std = opt['std'] if 'std' in opt else None
         self.task = opt['task'] if 'task' in opt else None
         self.noise = opt['noise'] if 'noise' in opt else 0
 
-        self.gt_folder, self.lq_folder = opt['dataroot_gt'], opt['dataroot_lq']
+        self.gt_folder = opt['dataroot_gt']
+        self.lq_folder = opt['dataroot_lq']
+
+        # Superpixel map folder (optional)
+        self.sp_folder = opt.get('dataroot_sp', None)
+
         if 'filename_tmpl' in opt:
             self.filename_tmpl = opt['filename_tmpl']
         else:
             self.filename_tmpl = '{}'
 
         if self.io_backend_opt['type'] == 'lmdb':
-            self.io_backend_opt['db_paths'] = [self.lq_folder, self.gt_folder]
+            self.io_backend_opt['db_paths'] = [
+                self.lq_folder, self.gt_folder
+            ]
             self.io_backend_opt['client_keys'] = ['lq', 'gt']
-            self.paths = paired_paths_from_lmdb([self.lq_folder, self.gt_folder], ['lq', 'gt'])
-        elif 'meta_info_file' in self.opt and self.opt['meta_info_file'] is not None:
-            self.paths = paired_paths_from_meta_info_file([self.lq_folder, self.gt_folder], ['lq', 'gt'],
-                                                          self.opt['meta_info_file'], self.filename_tmpl)
+
+            self.paths = paired_paths_from_lmdb(
+                [self.lq_folder, self.gt_folder],
+                ['lq', 'gt']
+            )
+
+        elif (
+            'meta_info_file' in self.opt
+            and self.opt['meta_info_file'] is not None
+        ):
+            self.paths = paired_paths_from_meta_info_file(
+                [self.lq_folder, self.gt_folder],
+                ['lq', 'gt'],
+                self.opt['meta_info_file'],
+                self.filename_tmpl
+            )
+
         else:
-            self.paths = paired_paths_from_folder([self.lq_folder, self.gt_folder], ['lq', 'gt'], self.filename_tmpl, self.task)
+            self.paths = paired_paths_from_folder(
+                [self.lq_folder, self.gt_folder],
+                ['lq', 'gt'],
+                self.filename_tmpl,
+                self.task
+            )
 
     def __getitem__(self, index):
+
         if self.file_client is None:
-            self.file_client = FileClient(self.io_backend_opt.pop('type'), **self.io_backend_opt)
+            self.file_client = FileClient(
+                self.io_backend_opt.pop('type'),
+                **self.io_backend_opt
+            )
 
         scale = self.opt['scale']
 
-        # Load gt and lq images. Dimension order: HWC; channel order: BGR;
+        # --------------------------------------------------
+        # Load GT and LQ images
+        # --------------------------------------------------
 
         if self.task == 'CAR':
-            # image range: [0, 255], int., H W 1
 
             gt_path = self.paths[index]['gt_path']
             img_bytes = self.file_client.get(gt_path, 'gt')
-            img_gt = imfrombytes(img_bytes, flag='grayscale', float32=False)
+
+            img_gt = imfrombytes(
+                img_bytes,
+                flag='grayscale',
+                float32=False
+            )
+
             lq_path = self.paths[index]['lq_path']
             img_bytes = self.file_client.get(lq_path, 'lq')
-            img_lq = imfrombytes(img_bytes, flag='grayscale', float32=False)
-            img_gt = np.expand_dims(img_gt, axis=2).astype(np.float32) / 255.
-            img_lq = np.expand_dims(img_lq, axis=2).astype(np.float32) / 255.
-    
-        elif self.task == 'denoising_gray': # Matlab + OpenCV version
+
+            img_lq = imfrombytes(
+                img_bytes,
+                flag='grayscale',
+                float32=False
+            )
+
+            img_gt = np.expand_dims(
+                img_gt, axis=2
+            ).astype(np.float32) / 255.
+
+            img_lq = np.expand_dims(
+                img_lq, axis=2
+            ).astype(np.float32) / 255.
+
+        elif self.task == 'denoising_gray':
+
             gt_path = self.paths[index]['gt_path']
             lq_path = gt_path
+
             img_bytes = self.file_client.get(gt_path, 'gt')
-            # OpenCV version, following "Deep Convolutional Dictionary Learning for Image Denoising"
-            img_gt = imfrombytes(img_bytes, flag='grayscale', float32=True)
-            # # Matlab version (using this version may have 0.6dB improvement, which is unfair for comparison)
-            # img_gt = imfrombytes(img_bytes, flag='unchanged', float32=True)
-            # if img_gt.ndim != 2:
-            #     img_gt = rgb2ycbcr(cv2.cvtColor(img_gt, cv2.COLOR_BGR2RGB), y_only=True)
+
+            img_gt = imfrombytes(
+                img_bytes,
+                flag='grayscale',
+                float32=True
+            )
+
             if self.opt['phase'] != 'train':
                 np.random.seed(seed=0)
-            img_lq = img_gt + np.random.normal(0, self.noise/255., img_gt.shape)
+
+            img_lq = img_gt + np.random.normal(
+                0,
+                self.noise / 255.,
+                img_gt.shape
+            )
+
             img_gt = np.expand_dims(img_gt, axis=2)
             img_lq = np.expand_dims(img_lq, axis=2)
 
         elif self.task == 'denoising_color':
+
             gt_path = self.paths[index]['gt_path']
             lq_path = gt_path
+
             img_bytes = self.file_client.get(gt_path, 'gt')
-            img_gt = imfrombytes(img_bytes, float32=True)
+
+            img_gt = imfrombytes(
+                img_bytes,
+                float32=True
+            )
+
             if self.opt['phase'] != 'train':
                 np.random.seed(seed=0)
-            img_lq = img_gt + np.random.normal(0, self.noise/255., img_gt.shape)
+
+            img_lq = img_gt + np.random.normal(
+                0,
+                self.noise / 255.,
+                img_gt.shape
+            )
 
         else:
-            # image range: [0, 1], float32., H W 3
+
             gt_path = self.paths[index]['gt_path']
             img_bytes = self.file_client.get(gt_path, 'gt')
-            img_gt = imfrombytes(img_bytes, float32=True)
+
+            img_gt = imfrombytes(
+                img_bytes,
+                float32=True
+            )
+
             lq_path = self.paths[index]['lq_path']
             img_bytes = self.file_client.get(lq_path, 'lq')
-            img_lq = imfrombytes(img_bytes, float32=True)
 
-        # augmentation for training
+            img_lq = imfrombytes(
+                img_bytes,
+                float32=True
+            )
+
+        # --------------------------------------------------
+        # Load corresponding Superpixel map
+        # --------------------------------------------------
+
+        sp_map = None
+
+        if self.sp_folder is not None:
+
+            sp_path = osp.join(
+                self.sp_folder,
+                osp.splitext(osp.basename(lq_path))[0] + '.npy'
+            )
+
+            sp_map = np.load(sp_path)
+
+            # Handle maps saved with an extra batch dimension
+            sp_map = np.squeeze(sp_map)
+
+            assert sp_map.ndim == 2, (
+                f"Expected a 2D SP map, got shape {sp_map.shape}"
+            )
+
+            sp_map = sp_map.astype(np.int64)
+
+            assert sp_map.shape == img_lq.shape[:2], (
+                f"SP map shape {sp_map.shape} "
+                f"does not match LR image shape {img_lq.shape[:2]}"
+            )
+
+        # --------------------------------------------------
+        # Augmentation for training
+        # --------------------------------------------------
+
         if self.opt['phase'] == 'train':
+
             gt_size = self.opt['gt_size']
-            # random crop
-            img_gt, img_lq = paired_random_crop(img_gt, img_lq, gt_size, scale, gt_path)
-            # flip, rotation
-            img_gt, img_lq = augment([img_gt, img_lq], self.opt['use_hflip'], self.opt['use_rot'])
 
-        # color space transform
+            if sp_map is not None:
+
+                lq_size = gt_size // scale
+
+                h_lq, w_lq = img_lq.shape[:2]
+
+                assert h_lq >= lq_size and w_lq >= lq_size, (
+                    f"Image size {(h_lq, w_lq)} "
+                    f"is smaller than crop size {lq_size}"
+                )
+
+                assert img_gt.shape[0] == h_lq * scale
+                assert img_gt.shape[1] == w_lq * scale
+
+                # Random crop coordinates
+                top = random.randint(0, h_lq - lq_size)
+                left = random.randint(0, w_lq - lq_size)
+
+                # Crop GT
+                img_gt = img_gt[
+                    top * scale:(top + lq_size) * scale,
+                    left * scale:(left + lq_size) * scale,
+                    :
+                ]
+
+                # Crop LQ
+                img_lq = img_lq[
+                    top:top + lq_size,
+                    left:left + lq_size,
+                    :
+                ]
+
+                # Crop Superpixel map
+                sp_map = sp_map[
+                    top:top + lq_size,
+                    left:left + lq_size
+                ]
+
+                # Add channel dimension for augmentation
+                sp_map = sp_map[:, :, None]
+
+                # Apply identical augmentation
+                img_gt, img_lq, sp_map = augment(
+                    [img_gt, img_lq, sp_map],
+                    self.opt['use_hflip'],
+                    self.opt['use_rot']
+                )
+
+                sp_map = sp_map[:, :, 0]
+
+            else:
+
+                # Original BasicSR behavior
+                img_gt, img_lq = paired_random_crop(
+                    img_gt,
+                    img_lq,
+                    gt_size,
+                    scale,
+                    gt_path
+                )
+
+                img_gt, img_lq = augment(
+                    [img_gt, img_lq],
+                    self.opt['use_hflip'],
+                    self.opt['use_rot']
+                )
+
+        # --------------------------------------------------
+        # Color space transformation
+        # --------------------------------------------------
+
         if 'color' in self.opt and self.opt['color'] == 'y':
-            img_gt = rgb2ycbcr(img_gt, y_only=True)[..., None]
-            img_lq = rgb2ycbcr(img_lq, y_only=True)[..., None]
 
-        # crop the unmatched GT images during validation or testing, especially for SR benchmark datasets
-        # TODO: It is better to update the datasets, rather than force to crop
+            img_gt = rgb2ycbcr(
+                img_gt,
+                y_only=True
+            )[..., None]
+
+            img_lq = rgb2ycbcr(
+                img_lq,
+                y_only=True
+            )[..., None]
+
+        # --------------------------------------------------
+        # Crop unmatched GT during validation/testing
+        # --------------------------------------------------
+
         if self.opt['phase'] != 'train':
-            img_gt = img_gt[0:img_lq.shape[0] * scale, 0:img_lq.shape[1] * scale, :]
 
-        # BGR to RGB, HWC to CHW, numpy to tensor
-        img_gt, img_lq = img2tensor([img_gt, img_lq], bgr2rgb=True, float32=True)
-        # normalize
+            img_gt = img_gt[
+                0:img_lq.shape[0] * scale,
+                0:img_lq.shape[1] * scale,
+                :
+            ]
+
+        # --------------------------------------------------
+        # Convert images to tensors
+        # --------------------------------------------------
+
+        img_gt, img_lq = img2tensor(
+            [img_gt, img_lq],
+            bgr2rgb=True,
+            float32=True
+        )
+
         if self.mean is not None or self.std is not None:
-            normalize(img_lq, self.mean, self.std, inplace=True)
-            normalize(img_gt, self.mean, self.std, inplace=True)
 
-        return {'lq': img_lq, 'gt': img_gt, 'lq_path': lq_path, 'gt_path': gt_path}
+            normalize(
+                img_lq,
+                self.mean,
+                self.std,
+                inplace=True
+            )
+
+            normalize(
+                img_gt,
+                self.mean,
+                self.std,
+                inplace=True
+            )
+
+        # --------------------------------------------------
+        # Prepare output
+        # --------------------------------------------------
+
+        result = {
+            'lq': img_lq,
+            'gt': img_gt,
+            'lq_path': lq_path,
+            'gt_path': gt_path
+        }
+
+        if sp_map is not None:
+
+            sp_map = np.ascontiguousarray(sp_map)
+
+            result['sp_map'] = torch.from_numpy(
+                sp_map
+            ).long()
+
+        return result
 
     def __len__(self):
         return len(self.paths)
