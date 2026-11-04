@@ -43,66 +43,66 @@ def SP_global_sampling(x,
         
     """
 
-  if tp == 'bchw':
-    x = x.permute(0,2,3,1)
-
-elif tp != 'bhwc':
-  raise ValueError(f'Unsupported tensor format : {tp}')
-
-B,H,W,C = x.shape
-
-if sp_map.shape != (B,H,W):
-  raise ValueError(f'Expected sp_map shape {B,H,W}',
-                  f'got {tuple(sp_map.shape)}')
-
-sp_map = sp_map.to(device = x.device , dtype = torch.long)
-
-if torch.any(sp_map < 0 ):
-  raise ValueError('Superpixel IDs must be non_negative.')
-
-inverse_map = torch.empty_like(sp_map)
-sp_ids = []
-max_sp = 0
-
-for b in range(B):
-  unique_ids , inverse = torch.unique(
-    sp_map[b].reshape(-1),
-    sorted = True,
-    return_inverse = True
-  )
-  inverse_map[b] = inverse.reshape(H,W)
-  sp_ids.append(unique_ids)
-  max_sp = max(max_sp , unique_ids.numel())
-
-X_SP = x.new_zoes(B,max_sp,C)
-
-for b in range(B):
-  labels = inverse_map[b].reshape(-1)
-  features = x[b].reshape(H*W,C)
-
-  sums = x.new_zeros(max_sp , C)
-  sums.index_add_(0,labels,features)
-
-  counts = torch.bincount(
-    labels,
-    minlength = max_sp).to(dtype = x.dtype)
-
-  X_SP[b] = sums / count.clamp_min(1).unsqueeze(-1)
-
-if output not in (0,1,2):
-  raise ValueError(f'Unsupported output :{output}')
-if output == 2 :
-  result = (X_SP , X_SP)
-  
-else:
-  result = X_SP
-  
-if return_inverse :
-  return( *result , inverse_map ) if isinstance(result, tuple) else(
-    result , inverse_map
-  )
-
-return result
+    if tp == 'bchw':
+        x = x.permute(0,2,3,1)
+    
+    elif tp != 'bhwc':
+      raise ValueError(f'Unsupported tensor format : {tp}')
+    
+    B,H,W,C = x.shape
+    
+    if sp_map.shape != (B,H,W):
+      raise ValueError(f'Expected sp_map shape {B,H,W}',
+                      f'got {tuple(sp_map.shape)}')
+    
+    sp_map = sp_map.to(device = x.device , dtype = torch.long)
+    
+    if torch.any(sp_map < 0 ):
+      raise ValueError('Superpixel IDs must be non_negative.')
+    
+    inverse_map = torch.empty_like(sp_map)
+    sp_ids = []
+    max_sp = 0
+    
+    for b in range(B):
+      unique_ids , inverse = torch.unique(
+        sp_map[b].reshape(-1),
+        sorted = True,
+        return_inverse = True
+      )
+      inverse_map[b] = inverse.reshape(H,W)
+      sp_ids.append(unique_ids)
+      max_sp = max(max_sp , unique_ids.numel())
+    
+    X_SP = x.new_zoes(B,max_sp,C)
+    
+    for b in range(B):
+      labels = inverse_map[b].reshape(-1)
+      features = x[b].reshape(H*W,C)
+    
+      sums = x.new_zeros(max_sp , C)
+      sums.index_add_(0,labels,features)
+    
+      counts = torch.bincount(
+        labels,
+        minlength = max_sp).to(dtype = x.dtype)
+    
+      X_SP[b] = sums / count.clamp_min(1).unsqueeze(-1)
+    
+    if output not in (0,1,2):
+      raise ValueError(f'Unsupported output :{output}')
+    if output == 2 :
+      result = (X_SP , X_SP)
+      
+    else:
+      result = X_SP
+      
+    if return_inverse :
+      return( *result , inverse_map ) if isinstance(result, tuple) else(
+        result , inverse_map
+      )
+    
+    return result
 
 
 def SP_broadcast (x_sp , inverse_map):
