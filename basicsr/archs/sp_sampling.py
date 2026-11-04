@@ -74,7 +74,7 @@ def SP_global_sampling(x,
       sp_ids.append(unique_ids)
       max_sp = max(max_sp , unique_ids.numel())
     
-    X_SP = x.new_zoes(B,max_sp,C)
+    X_SP = x.new_zeros(B,max_sp,C)
     
     for b in range(B):
       labels = inverse_map[b].reshape(-1)
@@ -87,7 +87,7 @@ def SP_global_sampling(x,
         labels,
         minlength = max_sp).to(dtype = x.dtype)
     
-      X_SP[b] = sums / count.clamp_min(1).unsqueeze(-1)
+      X_SP[b] = sums / counts.clamp_min(1).unsqueeze(-1)
     
     if output not in (0,1,2):
       raise ValueError(f'Unsupported output :{output}')
@@ -113,6 +113,9 @@ def SP_broadcast (x_sp , inverse_map):
   """
   B, H, W  = inverse_map.shape
   C  = x_sp.shape[-1]
+ 
+  index = inverse_map.reshape(B, H * W)
+
 
   x_out = torch.gather(
     x_sp,
