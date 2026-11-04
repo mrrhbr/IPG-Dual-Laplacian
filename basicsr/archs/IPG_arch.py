@@ -23,7 +23,7 @@ from basicsr.utils.registry import ARCH_REGISTRY
 from basicsr.archs.arch_util import to_2tuple, trunc_normal_
 import numpy as np
 import einops
-
+from sp_sampling import SP_global_sampling, SP_broadcast
 from ipg_kit import flex, cossim, local_sampling, global_sampling
 
 list_to_save = list()
@@ -307,41 +307,86 @@ class IPG_Grapher(nn.Module):
         return relative_position_bias.unsqueeze(0)
 
 
-    def get_correlation(self, x1, x2, graph):
+    def get_correlation(self, x1, x2, graph, valid_mask=None, use_sp=False):
+        """Compute graph-constrained attention.
+
+        valid_mask: [B, S], True for real superpixel nodes and False for padding.
+        """
         scale = torch.exp(torch.clamp(self.logit_scale, max=4.6052))
-        if self.graph_switch:
-            assert (x1.size(-2) == graph.size(-2)) and (x2.size(-2) == graph.size(-1))
+        if self.graph_switch and graph is not None:
+            assert x1.size(-2) == graph.size(-2), (x1.shape, graph.shape)
+            assert x2.size(-2) == graph.size(-1), (x2.shape, graph.shape)
 
         sim = cossim(x1, x2, graph=graph if self.graph_switch else None)
-        
-        sim = sim * scale + self.rel_pos_bias()
-        
-        sim = F.softmax(sim, dim=-1)
+        sim = sim * scale
 
-        return sim
+        # The original relative-position bias is defined for regular GN windows.
+        # It has no meaningful coordinates for irregular superpixel nodes.
+        if not use_sp:
+            sim = sim + self.rel_pos_bias()
+
+        if valid_mask is not None:
+            # Mask padded keys before softmax. Shape: [B, 1, 1, S].
+            key_mask = valid_mask[:, None, None, :]
+            sim = sim.masked_fill(~key_mask, torch.finfo(sim.dtype).min)
+
+        return F.softmax(sim, dim=-1)
 
 
-    def forward(self, x_complete, graph=None, sampling_method=0):
+    def forward(self, x_complete, graph=None, sampling_method=0, sp_map=None):
+        """x_complete is BHWC. GN returns window tokens; GS returns pixel tokens."""
+        use_sp = sampling_method != 0
 
-        if sampling_method == 0:
-            x = local_sampling(x_complete, group_size=self.group_size, unfold_dict=None, output=0, tp='bhwc')
+        if not use_sp:
+            # Original dense/local GN path -- intentionally unchanged.
+            x = local_sampling(
+                x_complete, group_size=self.group_size,
+                unfold_dict=None, output=0, tp='bhwc')
+            valid_mask = None
+            inverse_map = None
         else:
-            x = global_sampling(x_complete, group_size=self.group_size, sample_size=None, output=0, tp='bhwc')
-            
+            if sp_map is None:
+                raise ValueError('sp_map is required when sampling_method=1 (GS).')
+            if sp_map.ndim == 4 and sp_map.size(1) == 1:
+                sp_map = sp_map[:, 0]
+            if sp_map.shape[:1] != x_complete.shape[:1] or sp_map.shape[1:3] != x_complete.shape[1:3]:
+                raise ValueError(
+                    f'sp_map shape {tuple(sp_map.shape)} must match image feature size '
+                    f'{(x_complete.shape[0], x_complete.shape[1], x_complete.shape[2])}.')
+            x, inverse_map, valid_mask = SP_global_sampling(
+                x_complete, sp_map, output=0, tp='bhwc',
+                return_inverse=True, return_valid_mask=True)
+
         b_, n, c = x.shape
-        x1 = einops.rearrange(self.proj_group(x), 'b n (h c) -> b h n c', b=b_, n=n, h=self.num_heads)
+        x1 = einops.rearrange(
+            self.proj_group(x), 'b n (h c) -> b h n c',
+            b=b_, n=n, h=self.num_heads)
 
-        if sampling_method == 0:
-            x_sampled = local_sampling(self.proj_sample(x_complete), group_size=self.group_size, unfold_dict=self.unfold_dict, output=1, tp='bhwc')
+        if not use_sp:
+            # Original GN K/V sampling.
+            x_sampled = local_sampling(
+                self.proj_sample(x_complete), group_size=self.group_size,
+                unfold_dict=self.unfold_dict, output=1, tp='bhwc')
         else:
-            x_sampled = global_sampling(self.proj_sample(x_complete), group_size=self.group_size, sample_size=self.sample_size, output=1, tp='bhwc')
-        
-        x2, feat = einops.rearrange(x_sampled, 'b n (div h c) -> div b h n c', div=2, h=self.num_heads, c=c//self.num_heads)
+            # K and V must be pooled with exactly the same SP partition as Q.
+            x_sampled = SP_global_sampling(
+                self.proj_sample(x_complete), sp_map,
+                output=0, tp='bhwc')
 
-        corr = self.get_correlation(x1, x2, graph)
+        x2, feat = einops.rearrange(
+            x_sampled, 'b n (div h c) -> div b h n c',
+            div=2, h=self.num_heads, c=c // self.num_heads)
 
+        corr = self.get_correlation(
+            x1, x2, graph, valid_mask=valid_mask, use_sp=use_sp)
         x = (corr @ feat).transpose(1, 2).reshape(b_, n, c)
         x = self.proj(x)
+
+        if use_sp:
+            # Padded query nodes are not real nodes; zero them before broadcasting.
+            x = x * valid_mask.unsqueeze(-1).to(x.dtype)
+            x = SP_broadcast(x, inverse_map)  # [B, H, W, C]
+            x = x.reshape(b_, -1, c)          # [B, H*W, C]
 
         return x
 
@@ -400,7 +445,7 @@ class GAL(nn.Module):
         conv_type = kwargs.get('conv_type') or ''
         self.conv_block = CAB(num_feat=dim, compress_ratio=compress_ratio, squeeze_factor=squeeze_factor, conv_type=conv_type) if self.conv_scale != 0 else None
 
-    def forward(self, x, x_size, graph):
+    def forward(self, x, x_size, graph, sp_map=None):
         H, W = x_size
         B, _, C = x.shape
         
@@ -410,13 +455,17 @@ class GAL(nn.Module):
         conv_x = self.conv_block(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1).contiguous().view(B, H * W, C) if self.conv_scale != 0 else 0
 
 
-        x = self.grapher(x, graph=graph[0] if self.sampling_method==0 else graph[1], sampling_method=self.sampling_method)
+        x = self.grapher(
+            x, graph=graph[0] if self.sampling_method == 0 else graph[1],
+            sampling_method=self.sampling_method, sp_map=sp_map)
 
-        # regroup
-        if self.sampling_method:
-            x = einops.rearrange(x, '(b numh numw) (sh sw) c -> b (sh numh sw numw) c', numh=H//self.window_size, numw=W//self.window_size, sh=self.window_size, sw=self.window_size)
-        else:
-            x = einops.rearrange(x, '(b numh numw) (sh sw) c -> b (numh sh numw sw) c', numh=H//self.window_size, numw=W//self.window_size, sh=self.window_size, sw=self.window_size)
+        # GN produces a list of local windows and needs the original regrouping.
+        # GS already broadcasts its SP-node output back to [B, H*W, C].
+        if self.sampling_method == 0:
+            x = einops.rearrange(
+                x, '(b numh numw) (sh sw) c -> b (numh sh numw sw) c',
+                numh=H // self.window_size, numw=W // self.window_size,
+                sh=self.window_size, sw=self.window_size)
 
         x = shortcut + self.drop_path(self.norm1(x)) + conv_x * self.conv_scale # Channel Attention
 
@@ -556,12 +605,15 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x, x_size, graph):
+    def forward(self, x, x_size, graph, sp_map=None):
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
+                # Keep non-tensor metadata in the closure while checkpointing x.
+                x = checkpoint.checkpoint(
+                    lambda inp: blk(inp, x_size, graph, sp_map), x,
+                    use_reentrant=False)
             else:
-                x = blk(x, x_size, graph)
+                x = blk(x, x_size, graph, sp_map=sp_map)
         if self.downsample is not None:
             x = self.downsample(x)
         return x
@@ -672,7 +724,7 @@ class MGB(nn.Module):
         return (x_rs - F.interpolate(F.interpolate(x_rs, (H//scale, W//scale), mode='bilinear', align_corners=False), (H,W), mode='bilinear', align_corners=False)).abs().sum(dim=1)
     
     @torch.no_grad()
-    def calc_graph(self, x_, x_size):
+    def calc_graph(self, x_, x_size ,sp_map =None):
         if self.output_folder is not None:
             list_to_save.append(x_.cpu())
         if not self.graph_switch:
@@ -695,7 +747,9 @@ class MGB(nn.Module):
         
         ''' Added: x_diff for interdiff_plain'''
         X_diff = [None, None]
-        if self.flex_type.startswith('interdiff'):
+        # X_diff/flex budget allocation belongs to the original GN grid graph.
+        # The GS superpixel graph uses direct cosine Top-K instead.
+        if isinstance(self.flex_type, str) and self.flex_type.startswith('interdiff'):
             X_diff = self.diff(x_, x_size) # (b h w) do var on C dimension
             if (self.diff_scale is not None) and (self.diff_scale != 0): # perform X_diff scaling
                 # affine transform
@@ -707,25 +761,46 @@ class MGB(nn.Module):
             ]
 
         graph0 = self.calc_graph_(x_, x_size, sampling_method=0, X_diff=X_diff[0])
-        graph1 = self.calc_graph_(x_, x_size, sampling_method=1, X_diff=X_diff[1])
+        graph1 = self.calc_graph_(x_, x_size, sampling_method=1, X_diff=None, sp_map=sp_map)
         return (graph0, graph1)
 
     @torch.no_grad()
-    def calc_graph_(self, x_, x_size, sampling_method=0, X_diff=None):
+    def calc_graph_(self, x_, x_size, sampling_method=0, X_diff=None, sp_map=None):
         ''' x: (b c h w)
         '''
         # head_wise: not implemented
         he = self.num_head if self.head_wise else 1
         x = einops.rearrange(x_, 'b (h w) c -> b c h w', h=x_size[0], w=x_size[1])
         # cyclic shift
-        if sampling_method: # sparse global
-            X_sample, Y_sample = global_sampling(x, group_size=self.window_size, sample_size=self.sample_size, output=2, tp='bchw')
+        if sampling_method: # SIN superpixel graph
+            if sp_map is None:
+                raise ValueError('sp_map is required to construct the GS superpixel graph.')
+            X_sample, Y_sample, valid_mask = SP_global_sampling(
+                x, sp_map, output=2, tp='bchw', return_valid_mask=True)
         else: # dense local
             X_sample, Y_sample = local_sampling(x, group_size=self.window_size, unfold_dict=self.unfold_dict, output=2, tp='bchw')
+            valid_mask = None
 
         assert X_sample.size(0) == Y_sample.size(0)
 
         D = self.dist(X_sample.unsqueeze(1), Y_sample.unsqueeze(1)).squeeze(1) # (b m n)
+
+        if sampling_method:
+            # Superpixel graph: direct cosine Top-K. No regular-grid X_diff/flex.
+            # The sampler pads each batch item to S_max and provides the valid nodes.
+            batch_size, num_nodes, _ = D.shape
+            k = max(1, min(int(self.top_k), num_nodes))
+            valid_keys = valid_mask[:, None, :]
+            scores = D.masked_fill(~valid_keys, torch.finfo(D.dtype).min)
+            top_idx = scores.topk(k=k, dim=-1).indices
+            graph = torch.zeros_like(D, dtype=torch.bool)
+            graph.scatter_(-1, top_idx, True)
+            # Keep a self-loop for every real node, including when top_k is small.
+            eye = torch.eye(num_nodes, device=D.device, dtype=torch.bool).unsqueeze(0)
+            graph |= eye & valid_mask.unsqueeze(-1) & valid_mask.unsqueeze(1)
+            # Neither padded queries nor padded keys are valid graph nodes.
+            graph &= valid_mask.unsqueeze(-1) & valid_mask.unsqueeze(1)
+            return graph.unsqueeze(1)
         
         if self.fast_graph: # Fast graph construction
             maskarray = (X_diff/X_diff.sum(dim=-1,keepdim=True)) * D.size(1) * self.top_k
@@ -774,9 +849,11 @@ class MGB(nn.Module):
         return graph
 
 
-    def forward(self, x, x_size, prev_graph=None):
-        graph = self.calc_graph(x, x_size) if self.graph_flag else prev_graph
-        return self.patch_embed(self.conv(self.patch_unembed(self.residual_group(x, x_size, graph), x_size))) + x, graph
+    def forward(self, x, x_size, prev_graph=None, sp_map=None):
+        graph = self.calc_graph(x, x_size, sp_map=sp_map) if self.graph_flag else prev_graph
+        x = self.residual_group(x, x_size, graph, sp_map=sp_map)
+        x = self.patch_embed(self.conv(self.patch_unembed(x, x_size))) + x
+        return x, graph
 
     def flops(self):
         flops = 0
@@ -1096,7 +1173,7 @@ class IPG(nn.Module):
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
 
-    def forward_features(self, x):
+    def forward_features(self, x, sp_map=None):
         x_size = (x.shape[2], x.shape[3])
         x = self.patch_embed(x)
         if self.ape:
@@ -1104,14 +1181,14 @@ class IPG(nn.Module):
         x = self.pos_drop(x)
         prev_graph = None
         for layer in self.layers:
-            x, prev_graph = layer(x, x_size, prev_graph)
+            x, prev_graph = layer(x, x_size, prev_graph, sp_map=sp_map)
 
         x = self.norm(x)  # b seq_len c
         x = self.patch_unembed(x, x_size)
 
         return x
 
-    def forward(self, x):
+    def forward(self, x, sp_map=None):
         '''
         Set index & save input
         '''
@@ -1125,23 +1202,31 @@ class IPG(nn.Module):
                 output_idx = 0
             list_to_save.append(x.cpu())
         self.mean = self.mean.type_as(x)
+        if sp_map is not None:
+            if sp_map.ndim == 4 and sp_map.size(1) == 1:
+                sp_map = sp_map[:, 0]
+            if sp_map.ndim != 3 or tuple(sp_map.shape) != (x.shape[0], x.shape[2], x.shape[3]):
+                raise ValueError(
+                    f'Expected sp_map [B,H,W] matching input image; got {tuple(sp_map.shape)} '
+                    f'for input {tuple(x.shape)}.')
+            sp_map = sp_map.to(device=x.device, dtype=torch.long)
         x = (x - self.mean) * self.img_range
 
         if self.upsampler == 'pixelshuffle':
             # for classical SR
             x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.conv_after_body(self.forward_features(x, sp_map=sp_map)) + x
             x = self.conv_before_upsample(x)
             x = self.conv_last(self.upsample(x))
         elif self.upsampler == 'pixelshuffledirect':
             # for lightweight SR
             x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.conv_after_body(self.forward_features(x, sp_map=sp_map)) + x
             x = self.upsample(x)
         elif self.upsampler == 'nearest+conv':
             # for real-world SR
             x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.conv_after_body(self.forward_features(x, sp_map=sp_map)) + x
             x = self.conv_before_upsample(x)
             x = self.lrelu(self.conv_up1(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
             x = self.lrelu(self.conv_up2(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
@@ -1149,7 +1234,7 @@ class IPG(nn.Module):
         else:
             # for image denoising and JPEG compression artifact reduction
             x_first = self.conv_first(x)
-            res = self.conv_after_body(self.forward_features(x_first)) + x_first
+            res = self.conv_after_body(self.forward_features(x_first, sp_map=sp_map)) + x_first
             x = x + self.conv_last(res)
 
         x = x / self.img_range + self.mean
