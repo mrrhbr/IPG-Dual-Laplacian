@@ -86,9 +86,44 @@ class SRModel(BaseModel):
 
     def feed_data(self, data):
         self.lq = data['lq'].to(self.device)
+    
         if 'gt' in data:
             self.gt = data['gt'].to(self.device)
-
+    
+        # Load precomputed SIN Superpixel map
+        if 'sp_map' not in data:
+            raise KeyError(
+                "Missing 'sp_map' in dataset batch. "
+                "The IPG model with SIN Superpixel sampling requires sp_map "
+                "for both training and validation."
+            )
+    
+        self.sp_map = data['sp_map'].to(
+            self.device, dtype=torch.long, non_blocking=True
+        )
+    
+        # Expected shape: [B, H, W]
+        if self.sp_map.ndim == 4 and self.sp_map.shape[1] == 1:
+            self.sp_map = self.sp_map.squeeze(1)
+    
+        if self.sp_map.ndim != 3:
+            raise ValueError(
+                f"Expected sp_map with shape [B,H,W], "
+                f"but received {tuple(self.sp_map.shape)}"
+            )
+    
+        if self.sp_map.shape[0] != self.lq.shape[0]:
+            raise ValueError(
+                "Batch size mismatch between lq and sp_map: "
+                f"{self.lq.shape[0]} vs {self.sp_map.shape[0]}"
+            )
+    
+        if self.sp_map.shape[-2:] != self.lq.shape[-2:]:
+            raise ValueError(
+                "Spatial size mismatch between lq and sp_map: "
+                f"{tuple(self.lq.shape[-2:])} vs "
+                f"{tuple(self.sp_map.shape[-2:])}"
+            )
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
         self.output = self.net_g(self.lq)
