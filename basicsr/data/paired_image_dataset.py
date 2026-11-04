@@ -20,7 +20,7 @@ import torch
 
 @DATASET_REGISTRY.register()
 class PairedImageDataset(data.Dataset):
-    """Paired image dataset for image restoration."""
+    """Paired image dataset for image restoration with optional Superpixel maps."""
 
     def __init__(self, opt):
         super(PairedImageDataset, self).__init__()
@@ -31,24 +31,28 @@ class PairedImageDataset(data.Dataset):
 
         self.mean = opt['mean'] if 'mean' in opt else None
         self.std = opt['std'] if 'std' in opt else None
-        self.task = opt['task'] if 'task' in opt else None
-        self.noise = opt['noise'] if 'noise' in opt else 0
+        self.task = opt.get('task', None)
+        self.noise = opt.get('noise', 0)
 
         self.gt_folder = opt['dataroot_gt']
         self.lq_folder = opt['dataroot_lq']
 
-        # Superpixel map folder (optional)
+        # Optional Superpixel map folder
         self.sp_folder = opt.get('dataroot_sp', None)
 
-        if 'filename_tmpl' in opt:
-            self.filename_tmpl = opt['filename_tmpl']
-        else:
-            self.filename_tmpl = '{}'
+        self.filename_tmpl = opt.get('filename_tmpl', '{}')
+
+        # --------------------------------------------------
+        # Build paired image paths
+        # --------------------------------------------------
 
         if self.io_backend_opt['type'] == 'lmdb':
+
             self.io_backend_opt['db_paths'] = [
-                self.lq_folder, self.gt_folder
+                self.lq_folder,
+                self.gt_folder
             ]
+
             self.io_backend_opt['client_keys'] = ['lq', 'gt']
 
             self.paths = paired_paths_from_lmdb(
@@ -60,6 +64,7 @@ class PairedImageDataset(data.Dataset):
             'meta_info_file' in self.opt
             and self.opt['meta_info_file'] is not None
         ):
+
             self.paths = paired_paths_from_meta_info_file(
                 [self.lq_folder, self.gt_folder],
                 ['lq', 'gt'],
@@ -68,6 +73,7 @@ class PairedImageDataset(data.Dataset):
             )
 
         else:
+
             self.paths = paired_paths_from_folder(
                 [self.lq_folder, self.gt_folder],
                 ['lq', 'gt'],
@@ -77,7 +83,12 @@ class PairedImageDataset(data.Dataset):
 
     def __getitem__(self, index):
 
+        # --------------------------------------------------
+        # Initialize file client
+        # --------------------------------------------------
+
         if self.file_client is None:
+
             self.file_client = FileClient(
                 self.io_backend_opt.pop('type'),
                 **self.io_backend_opt
@@ -194,24 +205,36 @@ class PairedImageDataset(data.Dataset):
                 osp.splitext(osp.basename(lq_path))[0] + '.npy'
             )
 
+            if not osp.isfile(sp_path):
+                raise FileNotFoundError(
+                    f"Superpixel map not found: {sp_path}"
+                )
+
             sp_map = np.load(sp_path)
 
-            # Handle maps saved with an extra batch dimension
+            # Remove optional batch/channel dimensions
             sp_map = np.squeeze(sp_map)
 
-            assert sp_map.ndim == 2, (
-                f"Expected a 2D SP map, got shape {sp_map.shape}"
-            )
+            if sp_map.ndim != 2:
+                raise ValueError(
+                    f"Expected a 2D SP map, got shape {sp_map.shape}"
+                )
+
+            if np.any(sp_map < 0):
+                raise ValueError(
+                    f"Negative Superpixel IDs found in {sp_path}"
+                )
 
             sp_map = sp_map.astype(np.int64)
 
-            assert sp_map.shape == img_lq.shape[:2], (
-                f"SP map shape {sp_map.shape} "
-                f"does not match LR image shape {img_lq.shape[:2]}"
-            )
+            if sp_map.shape != img_lq.shape[:2]:
+                raise ValueError(
+                    f"SP map shape {sp_map.shape} "
+                    f"does not match LR image shape {img_lq.shape[:2]}"
+                )
 
         # --------------------------------------------------
-        # Augmentation for training
+        # Training augmentation
         # --------------------------------------------------
 
         if self.opt['phase'] == 'train':
@@ -220,23 +243,34 @@ class PairedImageDataset(data.Dataset):
 
             if sp_map is not None:
 
+                # LR crop size
                 lq_size = gt_size // scale
 
                 h_lq, w_lq = img_lq.shape[:2]
 
-                assert h_lq >= lq_size and w_lq >= lq_size, (
-                    f"Image size {(h_lq, w_lq)} "
-                    f"is smaller than crop size {lq_size}"
-                )
+                if h_lq < lq_size or w_lq < lq_size:
+                    raise ValueError(
+                        f"LR image size {(h_lq, w_lq)} "
+                        f"is smaller than crop size {lq_size}"
+                    )
 
-                assert img_gt.shape[0] == h_lq * scale
-                assert img_gt.shape[1] == w_lq * scale
+                if img_gt.shape[0] != h_lq * scale:
+                    raise ValueError(
+                        f"GT height {img_gt.shape[0]} "
+                        f"does not match LR height {h_lq} * scale {scale}"
+                    )
 
-                # Random crop coordinates
+                if img_gt.shape[1] != w_lq * scale:
+                    raise ValueError(
+                        f"GT width {img_gt.shape[1]} "
+                        f"does not match LR width {w_lq} * scale {scale}"
+                    )
+
+                # Random crop coordinates in LR space
                 top = random.randint(0, h_lq - lq_size)
                 left = random.randint(0, w_lq - lq_size)
 
-                # Crop GT
+                # Crop GT using scaled coordinates
                 img_gt = img_gt[
                     top * scale:(top + lq_size) * scale,
                     left * scale:(left + lq_size) * scale,
@@ -250,27 +284,43 @@ class PairedImageDataset(data.Dataset):
                     :
                 ]
 
-                # Crop Superpixel map
+                # Crop Superpixel map using identical LR coordinates
                 sp_map = sp_map[
                     top:top + lq_size,
                     left:left + lq_size
                 ]
 
-                # Add channel dimension for augmentation
+                # Add channel dimension for BasicSR augmentation
                 sp_map = sp_map[:, :, None]
 
-                # Apply identical augmentation
+                # OpenCV does not support int64 arrays in cv2.flip.
+                # Use int32 temporarily for augmentation.
+                sp_map = sp_map.astype(np.int32)
+
+                # Ensure all arrays are contiguous in memory.
+                # This is important because BasicSR augmentation
+                # performs in-place OpenCV flip operations.
+                img_gt = np.ascontiguousarray(img_gt)
+                img_lq = np.ascontiguousarray(img_lq)
+                sp_map = np.ascontiguousarray(sp_map)
+
+                # Apply exactly the same random augmentation
+                # to GT, LQ and Superpixel map.
                 img_gt, img_lq, sp_map = augment(
                     [img_gt, img_lq, sp_map],
                     self.opt['use_hflip'],
                     self.opt['use_rot']
                 )
 
-                sp_map = sp_map[:, :, 0]
+                # Remove channel dimension and restore int64
+                sp_map = np.ascontiguousarray(
+                    sp_map[:, :, 0],
+                    dtype=np.int64
+                )
 
             else:
 
-                # Original BasicSR behavior
+                # Original BasicSR paired crop
                 img_gt, img_lq = paired_random_crop(
                     img_gt,
                     img_lq,
@@ -279,6 +329,7 @@ class PairedImageDataset(data.Dataset):
                     gt_path
                 )
 
+                # Original BasicSR augmentation
                 img_gt, img_lq = augment(
                     [img_gt, img_lq],
                     self.opt['use_hflip'],
@@ -340,7 +391,7 @@ class PairedImageDataset(data.Dataset):
             )
 
         # --------------------------------------------------
-        # Prepare output
+        # Prepare output dictionary
         # --------------------------------------------------
 
         result = {
@@ -352,10 +403,8 @@ class PairedImageDataset(data.Dataset):
 
         if sp_map is not None:
 
-            sp_map = np.ascontiguousarray(sp_map)
-
             result['sp_map'] = torch.from_numpy(
-                sp_map
+                np.ascontiguousarray(sp_map)
             ).long()
 
         return result
