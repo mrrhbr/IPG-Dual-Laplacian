@@ -23,7 +23,7 @@ from basicsr.utils.registry import ARCH_REGISTRY
 from basicsr.archs.arch_util import to_2tuple, trunc_normal_
 import numpy as np
 import einops
-from sp_sampling import SP_global_sampling, SP_broadcast
+from .sp_sampling import SP_global_sampling, SP_broadcast
 from ipg_kit import flex, cossim, local_sampling, global_sampling
 
 list_to_save = list()
