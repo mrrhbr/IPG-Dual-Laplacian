@@ -1,3 +1,5 @@
+import torch
+import numpy as np
 from os import path as osp
 from torch.utils import data as data
 from torchvision.transforms.functional import normalize
@@ -34,6 +36,7 @@ class SingleImageDataset(data.Dataset):
         self.mean = opt['mean'] if 'mean' in opt else None
         self.std = opt['std'] if 'std' in opt else None
         self.lq_folder = opt['dataroot_lq']
+        self.sp_folder = opt['dataroot_sp']
 
         if self.io_backend_opt['type'] == 'lmdb':
             self.io_backend_opt['db_paths'] = [self.lq_folder]
@@ -54,6 +57,13 @@ class SingleImageDataset(data.Dataset):
         img_bytes = self.file_client.get(lq_path, 'lq')
         img_lq = imfrombytes(img_bytes, float32=True)
 
+        # load coresponding SPmap
+        filename =osp.splitext(osp.basename(lq_path))[0] + '.npy'
+        sp_map_path = osp.join(self.sp_folder , filename)
+
+        sp_map = np.load(sp_map_path)
+        sp_map = torch.from_numpy(sp_map).long()
+
         # color space transform
         if 'color' in self.opt and self.opt['color'] == 'y':
             img_lq = rgb2ycbcr(img_lq, y_only=True)[..., None]
@@ -63,7 +73,10 @@ class SingleImageDataset(data.Dataset):
         # normalize
         if self.mean is not None or self.std is not None:
             normalize(img_lq, self.mean, self.std, inplace=True)
-        return {'lq': img_lq, 'lq_path': lq_path}
+            
+        return {'lq': img_lq,
+                'sp_map': sp_map,
+                'lq_path': lq_path}
 
     def __len__(self):
         return len(self.paths)
