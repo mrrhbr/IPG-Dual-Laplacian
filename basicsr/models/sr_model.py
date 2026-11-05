@@ -1,5 +1,7 @@
 
 import torch
+import torch.nn.functional as F
+
 from collections import OrderedDict
 from os import path as osp
 from tqdm import tqdm
@@ -9,6 +11,7 @@ from basicsr.losses import build_loss
 from basicsr.metrics import calculate_metric
 from basicsr.utils import get_root_logger, imwrite, tensor2img
 from basicsr.utils.registry import MODEL_REGISTRY
+
 from .base_model import BaseModel
 
 
@@ -19,13 +22,14 @@ class SRModel(BaseModel):
     def __init__(self, opt):
         super(SRModel, self).__init__(opt)
 
-        # define network
+        # Define network
         self.net_g = build_network(opt['network_g'], model=self)
         self.net_g = self.model_to_device(self.net_g)
         self.print_network(self.net_g)
 
-        # load pretrained models
+        # Load pretrained models
         load_path = self.opt['path'].get('pretrain_network_g', None)
+
         if load_path is not None:
             param_key = self.opt['path'].get('param_key_g', 'params')
             self.load_network(
@@ -50,12 +54,12 @@ class SRModel(BaseModel):
                 f'Use Exponential Moving Average with decay: {self.ema_decay}'
             )
 
-            # define EMA network
+            # Define EMA network
             self.net_g_ema = build_network(
                 self.opt['network_g'], model=self
             ).to(self.device)
 
-            # load pretrained model
+            # Load pretrained model
             load_path = self.opt['path'].get('pretrain_network_g', None)
 
             if load_path is not None:
@@ -70,7 +74,7 @@ class SRModel(BaseModel):
 
             self.net_g_ema.eval()
 
-        # define losses
+        # Define losses
         if train_opt.get('pixel_opt'):
             self.cri_pix = build_loss(
                 train_opt['pixel_opt']
@@ -90,7 +94,7 @@ class SRModel(BaseModel):
                 'Both pixel and perceptual losses are None.'
             )
 
-        # set up optimizers and schedulers
+        # Set up optimizers and schedulers
         self.setup_optimizers()
         self.setup_schedulers()
 
@@ -103,16 +107,16 @@ class SRModel(BaseModel):
                 optim_params.append(v)
             else:
                 logger = get_root_logger()
-                logger.warning(
-                    f'Params {k} will not be optimized.'
-                )
+                logger.warning(f'Params {k} will not be optimized.')
 
         optim_type = train_opt['optim_g'].pop('type')
+
         self.optimizer_g = self.get_optimizer(
             optim_type,
             optim_params,
             **train_opt['optim_g']
         )
+
         self.optimizers.append(self.optimizer_g)
 
     def feed_data(self, data):
@@ -168,13 +172,13 @@ class SRModel(BaseModel):
         l_total = 0
         loss_dict = OrderedDict()
 
-        # pixel loss
+        # Pixel loss
         if self.cri_pix:
             l_pix = self.cri_pix(self.output, self.gt)
             l_total += l_pix
             loss_dict['l_pix'] = l_pix
 
-        # perceptual loss
+        # Perceptual loss
         if self.cri_perceptual:
             l_percep, l_style = self.cri_perceptual(
                 self.output,
@@ -197,79 +201,80 @@ class SRModel(BaseModel):
         if self.ema_decay > 0:
             self.model_ema(decay=self.ema_decay)
 
-    #=======================
-
-    #=======================
-
     def test(self):
-        # Pad to multiplication of sample_size
+        # Pad to a multiple of sample_size
         sample_size = self.opt['network_g']['sample_size']
         scale = self.opt.get('scale', 1)
-    
+
         mod_pad_h, mod_pad_w = 0, 0
         _, _, h, w = self.lq.size()
-    
+
         if h % sample_size != 0:
             mod_pad_h = sample_size - h % sample_size
-    
+
         if w % sample_size != 0:
             mod_pad_w = sample_size - w % sample_size
-    
+
         # Pad LR image
         img = F.pad(
             self.lq,
             (0, mod_pad_w, 0, mod_pad_h),
-            'reflect'
+            mode='reflect'
         )
-    
-        # Pad superpixel map using replication
+
+        # Pad Superpixel map using replication
         sp_map = self.sp_map
-    
+
         if sp_map.ndim == 4 and sp_map.size(1) == 1:
             sp_map = sp_map.squeeze(1)
-    
+
         if mod_pad_h > 0 or mod_pad_w > 0:
             sp_map = F.pad(
                 sp_map.unsqueeze(1).float(),
                 (0, mod_pad_w, 0, mod_pad_h),
                 mode='replicate'
             ).squeeze(1).long()
-    
+
         # Inference
         if hasattr(self, 'net_g_ema'):
             self.net_g_ema.eval()
-    
+
             with torch.no_grad():
                 self.output = self.net_g_ema(
                     img,
                     sp_map=sp_map
                 )
-    
         else:
             self.net_g.eval()
-    
+
             with torch.no_grad():
                 self.output = self.net_g(
                     img,
                     sp_map=sp_map
                 )
-    
+
             self.net_g.train()
-    
+
         # Remove padding from SR output
         _, _, h, w = self.output.size()
-    
+
         self.output = self.output[
             :,
             :,
             0:h - mod_pad_h * scale,
             0:w - mod_pad_w * scale
         ]
-    
-    
 
-    #=======================
-    
+    def dist_validation(self, dataloader, current_iter, tb_logger, save_img):
+        """Distributed validation (rank 0 only)."""
+        if self.opt['rank'] == 0:
+            self.nondist_validation(
+                dataloader,
+                current_iter,
+                tb_logger,
+                save_img
+            )
+
     def nondist_validation(
         self, dataloader, current_iter, tb_logger, save_img
     ):
@@ -286,7 +291,6 @@ class SRModel(BaseModel):
 
             self._initialize_best_metric_results(dataset_name)
 
-        if with_metrics:
             self.metric_results = {
                 metric: 0 for metric in self.metric_results
             }
@@ -314,7 +318,7 @@ class SRModel(BaseModel):
                 metric_data['img2'] = gt_img
                 del self.gt
 
-            # tentative for out of GPU memory
+            # Tentative for out of GPU memory
             del self.lq
             del self.output
             del self.sp_map
